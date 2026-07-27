@@ -806,14 +806,30 @@
     const canvasStream = canvas.captureStream(30);
     const combined = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
 
-    let mimeType = 'video/webm;codecs=vp9,opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm;codecs=vp8,opus';
-    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
+    // Safari/iOS unterstützt in MediaRecorder KEIN WebM, nur MP4 (H.264/AAC).
+    // Chrome/Firefox unterstützen dagegen kein aufnehmbares MP4, nur WebM.
+    // Daher beide Familien der Reihe nach testen statt WebM zu erzwingen.
+    const mimeCandidates = [
+      'video/mp4;codecs=avc1,mp4a',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    let mimeType = mimeCandidates.find(c => MediaRecorder.isTypeSupported(c));
+    if (!mimeType) {
+      abortRender('Dieses Gerät/Browser unterstützt keinen der benötigten Video-Codecs (weder MP4 noch WebM) für die Aufnahme. Rendering ist hier aktuell nicht möglich.');
+      return;
+    }
+    const outputExt = mimeType.startsWith('video/mp4') ? 'mp4' : 'webm';
 
     const recorder = new MediaRecorder(combined, { mimeType, videoBitsPerSecond: 6_000_000 });
     activeRecorder = recorder;
     const chunks = [];
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onerror = (e) => {
+      abortRender('Recorder-Fehler: ' + (e && e.error && e.error.message ? e.error.message : 'unbekannter Fehler beim Aufnehmen.'));
+    };
 
     stage.classList.add('active');
     generateBtn.disabled = true;
@@ -946,10 +962,11 @@
     }
 
     recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/webm' });
+      const blob = new Blob(chunks, { type: mimeType.split(';')[0] });
       const url = URL.createObjectURL(blob);
       resultVideo.src = url;
       downloadBtn.href = url;
+      downloadBtn.download = 'sigma-edit.' + outputExt;
       stage.classList.remove('active');
       generateBtn.disabled = false;
       resultBox.classList.add('shown');
