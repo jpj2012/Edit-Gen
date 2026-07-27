@@ -340,7 +340,10 @@
   }
 
   canvas#stage-canvas {
-    display: none;
+    position: fixed;
+    top: 0;
+    left: -99999px;
+    pointer-events: none;
   }
 
   .result {
@@ -969,6 +972,7 @@
       downloadBtn.download = 'sigma-edit.' + outputExt;
       stage.classList.remove('active');
       generateBtn.disabled = false;
+      hintMsg.textContent = '';
       resultBox.classList.add('shown');
       resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
       if (audioCtx) audioCtx.close();
