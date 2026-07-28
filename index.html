@@ -1000,15 +1000,10 @@
       }
     }
 
-    function finishRender() {
-      stopped = true;
-      if (renderWatchdog) { clearTimeout(renderWatchdog); renderWatchdog = null; }
-      recorder.stop();
-      pauseAllVideos();
-      if (audioEl) audioEl.pause();
-    }
-
-    recorder.onstop = () => {
+    let completed = false;
+    function completeWithChunks() {
+      if (completed) return;
+      completed = true;
       const blob = new Blob(chunks, { type: mimeType.split(';')[0] });
       const url = URL.createObjectURL(blob);
       resultVideo.src = url;
@@ -1020,6 +1015,28 @@
       resultBox.classList.add('shown');
       resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
       if (audioCtx) audioCtx.close();
+    }
+
+    function finishRender() {
+      stopped = true;
+      if (renderWatchdog) { clearTimeout(renderWatchdog); renderWatchdog = null; }
+      // Manche Browser (v.a. Safari) feuern "onstop" nach recorder.stop()
+      // nicht immer zuverlässig. Erst versuchen, gepufferte Daten zu holen,
+      // dann stoppen, und falls "onstop" nach 5s trotzdem nicht kam, mit den
+      // bereits gesammelten Chunks zwangsweise fertigstellen statt ewig zu warten.
+      try { if (recorder.state !== 'inactive') recorder.requestData(); } catch (e) {}
+      setTimeout(() => {
+        try { if (recorder.state !== 'inactive') recorder.stop(); } catch (e) {}
+      }, 50);
+      setTimeout(() => {
+        if (!completed) completeWithChunks();
+      }, 5000);
+      pauseAllVideos();
+      if (audioEl) audioEl.pause();
+    }
+
+    recorder.onstop = () => {
+      completeWithChunks();
     };
 
     lastStep = 'Recorder starten';
