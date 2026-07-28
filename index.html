@@ -749,41 +749,54 @@
   async function startRender() {
     if (mediaItems.length === 0) return;
     renderCancelled = false;
+    let lastStep = 'Start';
 
     // Sicherheits-Timeout: Falls das Rendering nach 20s ohne echten Fortschritt
     // (z.B. weil ein Sandbox-/Vorschau-iframe MediaRecorder/captureStream blockiert)
-    // feststeckt, brechen wir ab statt für immer zu laden.
+    // feststeckt, brechen wir ab statt für immer zu laden. Zeigt den letzten
+    // erreichten Schritt, damit man sieht, WO genau es hängt.
     if (renderWatchdog) clearTimeout(renderWatchdog);
     renderWatchdog = setTimeout(() => {
       if (!renderCancelled) {
-        abortRender('Rendering hängt fest — vermutlich blockiert die aktuelle Vorschau-Umgebung Video-/Audio-Aufnahme-APIs. Öffne die Datei direkt im Browser (nicht in einem eingebetteten Vorschau-Tool) und versuche es erneut.');
+        abortRender('Rendering hängt fest bei Schritt: "' + lastStep + '". Vermutlich blockiert das Gerät/der Browser eine Video-/Audio-Aufnahme-API an dieser Stelle.');
       }
     }, 20000);
 
     try {
 
+    lastStep = 'Canvas vorbereiten';
     const fmt = FORMATS[selectedFormat];
     canvas.width = fmt.w;
     canvas.height = fmt.h;
     const noisePattern = ctx.createPattern(noiseCanvas, 'repeat');
 
     // Preload video elements & wait for readiness
+    lastStep = 'Medien werden geladen (0/' + mediaItems.length + ')';
+    let preloadIdx = 0;
     for (const item of mediaItems) {
+      preloadIdx++;
       if (item.type === 'video' && !item.el) {
+        lastStep = 'Video wird geladen (' + preloadIdx + '/' + mediaItems.length + ')';
         const v = document.createElement('video');
         v.src = item.url;
         v.muted = true;
         v.playsInline = true;
         v.preload = 'auto';
-        await new Promise((resolve) => {
-          v.addEventListener('loadeddata', resolve, { once: true });
-          v.load();
-        });
+        await Promise.race([
+          new Promise((resolve) => {
+            v.addEventListener('loadeddata', resolve, { once: true });
+            v.addEventListener('loadedmetadata', resolve, { once: true });
+            v.addEventListener('canplay', resolve, { once: true });
+            v.load();
+          }),
+          new Promise((resolve) => setTimeout(resolve, 8000)) // Absicherung: nicht ewig auf ein Video-Event warten
+        ]);
         item.el = v;
       }
       if (renderCancelled) return;
     }
 
+    lastStep = 'Audio-/Recorder-Setup';
     const total = selectedLength;
     const segDur = total / mediaItems.length;
     const flashOn = document.getElementById('flashCuts').checked;
@@ -795,8 +808,17 @@
     // eine stille), damit MediaRecorder auf Safari nicht zwei unterschiedliche
     // Codepfade (mit/ohne Audio-Track) durchläuft, die sich dort unterschiedlich
     // verhalten. Ohne audioFile bleibt sourceNode einfach unverbunden -> Stille.
+    lastStep = 'AudioContext erstellen';
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     activeAudioCtx = audioCtx;
+    // iOS startet AudioContext oft im Zustand "suspended" — ohne explizites
+    // resume() liefert der Audio-Track evtl. nie Daten, was die ganze Aufnahme
+    // (auch die Video-Spur) blockieren kann.
+    lastStep = 'AudioContext fortsetzen (resume)';
+    if (audioCtx.state === 'suspended') {
+      await Promise.race([audioCtx.resume(), new Promise((r) => setTimeout(r, 3000))]);
+    }
+    lastStep = 'Audio-Graph aufbauen';
     const destNode = audioCtx.createMediaStreamDestination();
     let sourceNode = null;
     if (audioFile) {
@@ -808,12 +830,14 @@
     }
     const audioTracks = destNode.stream.getAudioTracks();
 
+    lastStep = 'Canvas-Stream erfassen';
     const canvasStream = canvas.captureStream(30);
     const combined = new MediaStream([...canvasStream.getVideoTracks(), ...audioTracks]);
 
     // Safari/iOS unterstützt in MediaRecorder KEIN WebM, nur MP4 (H.264/AAC).
     // Chrome/Firefox unterstützen dagegen kein aufnehmbares MP4, nur WebM.
     // Daher beide Familien der Reihe nach testen statt WebM zu erzwingen.
+    lastStep = 'Unterstütztes Videoformat ermitteln';
     const mimeCandidates = [
       'video/mp4;codecs=avc1,mp4a',
       'video/mp4',
@@ -828,6 +852,7 @@
     }
     const outputExt = mimeType.startsWith('video/mp4') ? 'mp4' : 'webm';
 
+    lastStep = 'MediaRecorder erstellen (' + mimeType + ')';
     const recorder = new MediaRecorder(combined, { mimeType, videoBitsPerSecond: 6_000_000 });
     activeRecorder = recorder;
     const chunks = [];
@@ -980,8 +1005,11 @@
       if (audioCtx) audioCtx.close();
     };
 
+    lastStep = 'Recorder starten';
     recorder.start(200);
+    lastStep = 'Audio abspielen';
     if (audioEl) { try { await audioEl.play(); } catch (e) {} }
+    lastStep = 'Rendering läuft (Frames zeichnen)';
     requestAnimationFrame(frame);
 
     } catch (err) {
