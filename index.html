@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Metal+Mania&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@twemoji/api@latest/dist/twemoji.min.js" crossorigin="anonymous"></script>
 <style>
   :root {
     --bg: #0a0a0d;
@@ -738,6 +739,22 @@
 
   loadAudioFromDB().then((file) => { if (file) handleAudioFile(file); });
 
+  // ---------- Emoji-Sticker als farbige Bilder (Twemoji) ----------
+  // Canvas-Text (fillText) rendert Emojis je nach Betriebssystem/Browser
+  // nur schwarzweiß oder als Platzhalter-Punkte, weil dafür eine
+  // installierte Color-Emoji-Schriftart nötig wäre. Deshalb laden wir die
+  // Emojis stattdessen als farbige Twemoji-Grafiken (funktioniert überall
+  // gleich, unabhängig von installierten Schriftarten).
+  const STICKER_SET = ['💀','😈','🗿','⚡','🔥','👽','🩸','🖤','💯','🕷️'];
+  const emojiStickerImages = STICKER_SET.map((ch) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const cp = (window.twemoji && twemoji.convert) ? twemoji.convert.toCodePoint(ch) :
+      Array.from(ch).map(c => c.codePointAt(0).toString(16)).join('-');
+    img.src = `https://cdn.jsdelivr.net/gh/jdecked/twemoji@latest/assets/72x72/${cp}.png`;
+    return img;
+  });
+
   // ---------- Eigene Sticker-Bilder (statt Emoji) ----------
   let customStickers = []; // { blob, url, el }
 
@@ -973,7 +990,6 @@
     const flashOn = document.getElementById('flashCuts').checked;
     const zoomOn = document.getElementById('zoomPunch').checked;
     const stickersOn = document.getElementById('stickers').checked;
-    const STICKER_SET = ['💀','😈','🗿','⚡','🔥','👽','🩸','🖤','💯','🕷️'];
 
     // Audio graph — nur aufbauen, wenn wirklich eine Musikdatei gewählt wurde.
     // Ein erzwungener "stiller" Audio-Track (Variante die vorher hier stand) hat
@@ -1065,13 +1081,12 @@
       if (stickersOn) {
         if (customStickers.length > 0) {
           stickerImg = customStickers[Math.floor(Math.random() * customStickers.length)].el;
-          stickerChar = '';
         } else {
-          stickerChar = STICKER_SET[Math.floor(Math.random() * STICKER_SET.length)];
-          stickerImg = null;
+          stickerImg = emojiStickerImages[Math.floor(Math.random() * emojiStickerImages.length)];
         }
-        stickerX = 0.5 + (Math.random() - 0.5) * 0.2; // mittig mit leichtem Jitter
-        stickerY = 0.78 + (Math.random() - 0.5) * 0.06; // unteres Drittel
+        stickerChar = '';
+        stickerX = 0.5; // immer exakt mittig
+        stickerY = 0.78; // immer exakt derselbe Punkt im unteren Drittel
       } else {
         stickerChar = '';
         stickerImg = null;
@@ -1150,23 +1165,16 @@
       ctx.globalAlpha = 1;
 
       // sticker
-      if (stickerImg || stickerChar) {
+      if (stickerImg && stickerImg.naturalWidth > 0) {
         const segElapsed = (now - segStartTime) / 1000;
         if (segElapsed < 0.45) {
           ctx.save();
           ctx.globalAlpha = Math.max(0, 1 - segElapsed / 0.45);
-          if (stickerImg && stickerImg.naturalWidth > 0) {
-            const targetW = canvas.width * 0.32;
-            const targetH = targetW * (stickerImg.naturalHeight / stickerImg.naturalWidth);
-            const px = canvas.width * stickerX - targetW / 2;
-            const py = canvas.height * stickerY - targetH / 2;
-            ctx.drawImage(stickerImg, px, py, targetW, targetH);
-          } else if (stickerChar) {
-            ctx.font = Math.round(canvas.width * 0.22) + 'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(stickerChar, canvas.width * stickerX, canvas.height * stickerY);
-          }
+          const targetW = canvas.width * 0.32;
+          const targetH = targetW * (stickerImg.naturalHeight / stickerImg.naturalWidth);
+          const px = canvas.width * stickerX - targetW / 2;
+          const py = canvas.height * stickerY - targetH / 2;
+          ctx.drawImage(stickerImg, px, py, targetW, targetH);
           ctx.restore();
         }
       }
