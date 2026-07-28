@@ -770,7 +770,7 @@
     canvas.height = fmt.h;
     const noisePattern = ctx.createPattern(noiseCanvas, 'repeat');
 
-    // Preload video elements & wait for readiness
+    // Preload video & image elements & wait for readiness
     lastStep = 'Medien werden geladen (0/' + mediaItems.length + ')';
     let preloadIdx = 0;
     for (const item of mediaItems) {
@@ -792,6 +792,19 @@
           new Promise((resolve) => setTimeout(resolve, 8000)) // Absicherung: nicht ewig auf ein Video-Event warten
         ]);
         item.el = v;
+      } else if (item.type === 'image' && !item.el) {
+        lastStep = 'Bild wird geladen (' + preloadIdx + '/' + mediaItems.length + ')';
+        const img = new Image();
+        img.src = item.url;
+        await Promise.race([
+          new Promise((resolve) => {
+            if (img.complete && img.naturalWidth > 0) { resolve(); return; }
+            img.addEventListener('load', resolve, { once: true });
+            img.addEventListener('error', resolve, { once: true });
+          }),
+          new Promise((resolve) => setTimeout(resolve, 8000))
+        ]);
+        item.el = img;
       }
       if (renderCancelled) return;
     }
@@ -918,6 +931,7 @@
     let segStartTime = performance.now();
 
     function frame(now) {
+      try {
       if (stopped) return;
       if (startTime === null) startTime = now;
       const elapsed = (now - startTime) / 1000;
@@ -981,6 +995,9 @@
       progressFill.style.width = Math.min(100, (elapsed / total) * 100) + '%';
 
       requestAnimationFrame(frame);
+      } catch (err) {
+        abortRender('Fehler beim Zeichnen eines Frames: ' + (err && err.message ? err.message : err));
+      }
     }
 
     function finishRender() {
