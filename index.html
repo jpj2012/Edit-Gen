@@ -1289,20 +1289,37 @@
       const canvasRatio = cw / ch;
       let zoom = 1;
       let shakeX = 0, shakeY = 0;
-      if (zoomOn) {
+      // Wackeln läuft, sobald entweder Zoom-Punch ODER Beat-Sync aktiv ist —
+      // beim reinen Beat-Sync soll das Bild auch ohne Zoom-Punch-Haken auf die
+      // Beats wackeln. Die Zoom-Punch-Einblendung (Reinzoomen) bleibt aber nur
+      // an ihre eigene Checkbox gekoppelt.
+      if (zoomOn || allBeatTimes) {
         const segElapsed = (performance.now() - segStartTime) / 1000;
-        const punchProgress = segElapsed / currentSegDur;
-        zoom = 1 + Math.min(0.1, 0.1 * punchProgress);
-        // Kamera-Wackeln: stärker direkt beim Cut, klingt schnell ab
-        const cutShake = Math.max(0, 0.35 - segElapsed) * 6;
+        if (zoomOn) {
+          const punchProgress = segElapsed / currentSegDur;
+          zoom = 1 + Math.min(0.1, 0.1 * punchProgress);
+        }
+        // Kamera-Wackeln beim Cut: stärker, klingt in ~0.35s ab.
+        // Stärke ist relativ zur Canvas-Breite, damit es bei jeder Auflösung
+        // (720/1280px) klar sichtbar bleibt statt nur 1-2px zu betragen.
+        const cutShakeRatio = Math.max(0, 0.35 - segElapsed) / 0.35;
+        const cutShakePx = cutShakeRatio * cw * 0.022;
         // Zusätzlich ein kleineres Wackeln bei jedem Zwischen-Beat (nur Beat-Sync,
         // nur wenn ein Bild mehrere Beats stehen bleibt — bei nur 1 Beat pro Bild
         // ist jeder Beat ohnehin schon ein Cut und nutzt das stärkere Wackeln oben).
-        const beatElapsed = (performance.now() - beatPulseStartTime) / 1000;
-        const beatShake = Math.max(0, 0.18 - beatElapsed) * 2.2;
-        const shakeAmount = cutShake + beatShake;
+        let beatShakePx = 0;
+        if (allBeatTimes) {
+          const beatElapsed = (performance.now() - beatPulseStartTime) / 1000;
+          const beatShakeRatio = Math.max(0, 0.15 - beatElapsed) / 0.15;
+          beatShakePx = beatShakeRatio * cw * 0.01;
+        }
+        const shakeAmount = cutShakePx + beatShakePx;
         shakeX = (Math.random() - 0.5) * shakeAmount;
         shakeY = (Math.random() - 0.5) * shakeAmount;
+        // Sicherheits-Zoommarge: sorgt dafür, dass der Versatz durchs Wackeln
+        // nie über den Bildrand hinausschiebt und schwarze Ränder zeigt.
+        const neededMargin = (shakeAmount / 2) / Math.min(cw, ch);
+        zoom = Math.max(zoom, 1 + neededMargin * 1.5);
       }
       let drawW, drawH;
       if (mediaRatio > canvasRatio) {
