@@ -465,6 +465,7 @@
     <div class="audio-name" id="audioName">
       <svg class="cassette" viewBox="0 0 24 16" fill="none"><rect x="0.5" y="0.5" width="23" height="15" rx="2" stroke="#33e39c"/><circle cx="7" cy="8" r="3" stroke="#33e39c"/><circle cx="17" cy="8" r="3" stroke="#33e39c"/></svg>
       <span id="audioNameText"></span>
+      <span id="audioRemoveBtn" style="margin-left:10px; cursor:pointer; opacity:0.7; text-decoration:underline;">entfernen</span>
     </div>
 
     <div class="field" style="margin-top:16px;">
@@ -490,6 +491,12 @@
       <input type="checkbox" id="stickers">
       Meme-Sticker einblenden (💀 😈 🗿)
     </label>
+    <div id="customStickerArea" style="margin-top:12px; display:none;">
+      <button type="button" id="stickerUploadBtn" class="pill-btn" style="font-size:13px;">+ Eigene Sticker (PNG) hochladen</button>
+      <input type="file" id="stickerInput" accept="image/png,image/*" multiple style="display:none;">
+      <div id="stickerPreviewRow" style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;"></div>
+      <p style="font-size:12px; opacity:0.6; margin-top:6px;">Eigene Bilder werden statt der Emojis verwendet, sobald du welche hochlädst.</p>
+    </div>
   </div>
 
   <button class="generate-btn" id="generateBtn" disabled>⚡ EDIT RENDERN</button>
@@ -548,6 +555,11 @@
   const resultVideo = document.getElementById('resultVideo');
   const downloadBtn = document.getElementById('downloadBtn');
   const resetBtn = document.getElementById('resetBtn');
+  const stickersCheckbox = document.getElementById('stickers');
+  const customStickerArea = document.getElementById('customStickerArea');
+  const stickerUploadBtn = document.getElementById('stickerUploadBtn');
+  const stickerInput = document.getElementById('stickerInput');
+  const stickerPreviewRow = document.getElementById('stickerPreviewRow');
   const cancelRenderBtn = document.getElementById('cancelRenderBtn');
   const canvas = document.getElementById('stage-canvas');
   const ctx = canvas.getContext('2d');
@@ -657,7 +669,149 @@
       startOffsetVal.textContent = '0s';
     });
     updateGenerateState();
+    saveAudioToDB(file);
   }
+
+  // ---------- Track-Speicherung (IndexedDB) ----------
+  // Merkt sich den zuletzt hochgeladenen Track über Seiten-Reloads und neue
+  // Edits hinweg, damit er nicht bei jedem Video erneut hochgeladen werden muss.
+  const AUDIO_DB_NAME = 'sigmaEditDB';
+  const AUDIO_STORE = 'audio';
+  const AUDIO_KEY = 'lastAudio';
+  const STICKER_STORE = 'stickers';
+  const STICKER_KEY = 'customStickers';
+
+  function openAudioDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(AUDIO_DB_NAME, 2);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(AUDIO_STORE)) db.createObjectStore(AUDIO_STORE);
+        if (!db.objectStoreNames.contains(STICKER_STORE)) db.createObjectStore(STICKER_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveAudioToDB(file) {
+    try {
+      const db = await openAudioDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(AUDIO_STORE, 'readwrite');
+        tx.objectStore(AUDIO_STORE).put(file, AUDIO_KEY);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) { /* best effort, kein Problem falls nicht verfügbar */ }
+  }
+
+  async function loadAudioFromDB() {
+    try {
+      const db = await openAudioDB();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(AUDIO_STORE, 'readonly');
+        const req = tx.objectStore(AUDIO_STORE).get(AUDIO_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) { return null; }
+  }
+
+  async function clearAudioFromDB() {
+    try {
+      const db = await openAudioDB();
+      const tx = db.transaction(AUDIO_STORE, 'readwrite');
+      tx.objectStore(AUDIO_STORE).delete(AUDIO_KEY);
+    } catch (e) { /* ignore */ }
+  }
+
+  document.getElementById('audioRemoveBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    audioFile = null;
+    if (audioEl) { URL.revokeObjectURL(audioEl.src); audioEl = null; }
+    audioName.classList.remove('shown');
+    audioInput.value = '';
+    clearAudioFromDB();
+    updateGenerateState();
+  });
+
+  loadAudioFromDB().then((file) => { if (file) handleAudioFile(file); });
+
+  // ---------- Eigene Sticker-Bilder (statt Emoji) ----------
+  let customStickers = []; // { blob, url, el }
+
+  function renderStickerPreview() {
+    stickerPreviewRow.innerHTML = '';
+    customStickers.forEach((s, idx) => {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:relative; width:52px; height:52px;';
+      const img = document.createElement('img');
+      img.src = s.url;
+      img.style.cssText = 'width:100%; height:100%; object-fit:contain; border-radius:8px; background:#000;';
+      const rm = document.createElement('div');
+      rm.textContent = '✕';
+      rm.style.cssText = 'position:absolute; top:-6px; right:-6px; background:#ff2d55; color:#fff; width:18px; height:18px; border-radius:50%; font-size:11px; display:flex; align-items:center; justify-content:center; cursor:pointer;';
+      rm.addEventListener('click', () => {
+        URL.revokeObjectURL(s.url);
+        customStickers.splice(idx, 1);
+        renderStickerPreview();
+        saveStickersToDB();
+      });
+      wrap.appendChild(img);
+      wrap.appendChild(rm);
+      stickerPreviewRow.appendChild(wrap);
+    });
+  }
+
+  function addStickerBlobs(blobs) {
+    blobs.forEach((blob) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = url;
+      customStickers.push({ blob, url, el: img });
+    });
+    renderStickerPreview();
+  }
+
+  stickerUploadBtn.addEventListener('click', () => stickerInput.click());
+  stickerInput.addEventListener('change', () => {
+    const files = Array.from(stickerInput.files || []).filter(f => /^image\//.test(f.type));
+    if (files.length === 0) return;
+    addStickerBlobs(files);
+    saveStickersToDB();
+    stickerInput.value = '';
+  });
+
+  stickersCheckbox.addEventListener('change', () => {
+    customStickerArea.style.display = stickersCheckbox.checked ? 'block' : 'none';
+  });
+
+  async function saveStickersToDB() {
+    try {
+      const db = await openAudioDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(STICKER_STORE, 'readwrite');
+        tx.objectStore(STICKER_STORE).put(customStickers.map(s => s.blob), STICKER_KEY);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) { /* best effort */ }
+  }
+
+  async function loadStickersFromDB() {
+    try {
+      const db = await openAudioDB();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(STICKER_STORE, 'readonly');
+        const req = tx.objectStore(STICKER_STORE).get(STICKER_KEY);
+        req.onsuccess = () => resolve(req.result || []);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) { return []; }
+  }
+
+  loadStickersFromDB().then((blobs) => { if (blobs && blobs.length) addStickerBlobs(blobs); });
 
   startOffset.addEventListener('input', () => {
     startOffsetVal.textContent = startOffset.value + 's';
@@ -769,6 +923,10 @@
     canvas.width = fmt.w;
     canvas.height = fmt.h;
     const noisePattern = ctx.createPattern(noiseCanvas, 'repeat');
+    const glitchCanvas = document.createElement('canvas');
+    glitchCanvas.width = fmt.w;
+    glitchCanvas.height = fmt.h;
+    const glitchCtx = glitchCanvas.getContext('2d');
 
     // Preload video & image elements & wait for readiness
     lastStep = 'Medien werden geladen (0/' + mediaItems.length + ')';
@@ -815,33 +973,32 @@
     const flashOn = document.getElementById('flashCuts').checked;
     const zoomOn = document.getElementById('zoomPunch').checked;
     const stickersOn = document.getElementById('stickers').checked;
-    const STICKER_SET = ['💀','😈','🗿','⚡','🔥'];
+    const STICKER_SET = ['💀','😈','🗿','⚡','🔥','👽','🩸','🖤','💯','🕷️'];
 
-    // Audio graph — immer eine echte Audio-Spur erzeugen (auch ohne Musikdatei
-    // eine stille), damit MediaRecorder auf Safari nicht zwei unterschiedliche
-    // Codepfade (mit/ohne Audio-Track) durchläuft, die sich dort unterschiedlich
-    // verhalten. Ohne audioFile bleibt sourceNode einfach unverbunden -> Stille.
-    lastStep = 'AudioContext erstellen';
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    activeAudioCtx = audioCtx;
-    // iOS startet AudioContext oft im Zustand "suspended" — ohne explizites
-    // resume() liefert der Audio-Track evtl. nie Daten, was die ganze Aufnahme
-    // (auch die Video-Spur) blockieren kann.
-    lastStep = 'AudioContext fortsetzen (resume)';
-    if (audioCtx.state === 'suspended') {
-      await Promise.race([audioCtx.resume(), new Promise((r) => setTimeout(r, 3000))]);
-    }
-    lastStep = 'Audio-Graph aufbauen';
-    const destNode = audioCtx.createMediaStreamDestination();
-    let sourceNode = null;
+    // Audio graph — nur aufbauen, wenn wirklich eine Musikdatei gewählt wurde.
+    // Ein erzwungener "stiller" Audio-Track (Variante die vorher hier stand) hat
+    // die Aufnahme ohne Musik auf manchen Geräten instabil/kaputt gemacht.
+    let audioCtx = null, audioTracks = [];
     if (audioFile) {
-      sourceNode = audioCtx.createMediaElementSource(audioEl);
+      lastStep = 'AudioContext erstellen';
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      activeAudioCtx = audioCtx;
+      // iOS startet AudioContext oft im Zustand "suspended" — ohne explizites
+      // resume() liefert der Audio-Track evtl. nie Daten, was die ganze Aufnahme
+      // (auch die Video-Spur) blockieren kann.
+      lastStep = 'AudioContext fortsetzen (resume)';
+      if (audioCtx.state === 'suspended') {
+        await Promise.race([audioCtx.resume(), new Promise((r) => setTimeout(r, 3000))]);
+      }
+      lastStep = 'Audio-Graph aufbauen';
+      const destNode = audioCtx.createMediaStreamDestination();
+      const sourceNode = audioCtx.createMediaElementSource(audioEl);
       sourceNode.connect(destNode);
       sourceNode.connect(audioCtx.destination);
       audioEl.currentTime = parseInt(startOffset.value, 10) || 0;
       audioEl.loop = true;
+      audioTracks = destNode.stream.getAudioTracks();
     }
-    const audioTracks = destNode.stream.getAudioTracks();
 
     lastStep = 'Canvas-Stream erfassen';
     const canvasStream = canvas.captureStream(30);
@@ -851,11 +1008,18 @@
     // Chrome/Firefox unterstützen dagegen kein aufnehmbares MP4, nur WebM.
     // Daher beide Familien der Reihe nach testen statt WebM zu erzwingen.
     lastStep = 'Unterstütztes Videoformat ermitteln';
-    const mimeCandidates = [
+    const hasAudio = audioTracks.length > 0;
+    const mimeCandidates = hasAudio ? [
       'video/mp4;codecs=avc1,mp4a',
       'video/mp4',
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ] : [
+      'video/mp4;codecs=avc1',
+      'video/mp4',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
       'video/webm'
     ];
     let mimeType = mimeCandidates.find(c => MediaRecorder.isTypeSupported(c));
@@ -881,6 +1045,7 @@
     let flashAlpha = 0;
     let nextStickerAt = -1;
     let stickerChar = '';
+    let stickerImg = null;
     let stickerX = 0, stickerY = 0;
     let startTime = null;
     let stopped = false;
@@ -897,12 +1062,19 @@
         item.el.play().catch(() => {});
       }
       if (flashOn) flashAlpha = 0.8;
-      if (stickersOn && Math.random() < 0.6) {
-        stickerChar = STICKER_SET[Math.floor(Math.random() * STICKER_SET.length)];
-        stickerX = 0.15 + Math.random() * 0.7;
-        stickerY = 0.2 + Math.random() * 0.6;
+      if (stickersOn) {
+        if (customStickers.length > 0) {
+          stickerImg = customStickers[Math.floor(Math.random() * customStickers.length)].el;
+          stickerChar = '';
+        } else {
+          stickerChar = STICKER_SET[Math.floor(Math.random() * STICKER_SET.length)];
+          stickerImg = null;
+        }
+        stickerX = 0.5 + (Math.random() - 0.5) * 0.2; // mittig mit leichtem Jitter
+        stickerY = 0.78 + (Math.random() - 0.5) * 0.06; // unteres Drittel
       } else {
         stickerChar = '';
+        stickerImg = null;
       }
     }
 
@@ -911,9 +1083,15 @@
       const mediaRatio = mw / mh;
       const canvasRatio = cw / ch;
       let zoom = 1;
+      let shakeX = 0, shakeY = 0;
       if (zoomOn) {
         const segElapsed = (performance.now() - segStartTime) / 1000;
-        zoom = 1 + Math.min(0.1, 0.1 * (segElapsed / segDur));
+        const punchProgress = segElapsed / segDur;
+        zoom = 1 + Math.min(0.1, 0.1 * punchProgress);
+        // Kamera-Wackeln: stärker direkt beim Cut, klingt schnell ab
+        const shakeAmount = Math.max(0, 0.35 - segElapsed) * 6;
+        shakeX = (Math.random() - 0.5) * shakeAmount;
+        shakeY = (Math.random() - 0.5) * shakeAmount;
       }
       let drawW, drawH;
       if (mediaRatio > canvasRatio) {
@@ -923,8 +1101,8 @@
         drawW = cw * zoom;
         drawH = drawW / mediaRatio;
       }
-      const dx = (cw - drawW) / 2;
-      const dy = (ch - drawH) / 2;
+      const dx = (cw - drawW) / 2 + shakeX;
+      const dy = (ch - drawH) / 2 + shakeY;
       ctx.drawImage(el, dx, dy, drawW, drawH);
     }
 
@@ -972,23 +1150,42 @@
       ctx.globalAlpha = 1;
 
       // sticker
-      if (stickerChar) {
+      if (stickerImg || stickerChar) {
         const segElapsed = (now - segStartTime) / 1000;
         if (segElapsed < 0.45) {
           ctx.save();
           ctx.globalAlpha = Math.max(0, 1 - segElapsed / 0.45);
-          ctx.font = Math.round(canvas.width * 0.22) + 'px sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(stickerChar, canvas.width * stickerX, canvas.height * stickerY);
+          if (stickerImg && stickerImg.naturalWidth > 0) {
+            const targetW = canvas.width * 0.32;
+            const targetH = targetW * (stickerImg.naturalHeight / stickerImg.naturalWidth);
+            const px = canvas.width * stickerX - targetW / 2;
+            const py = canvas.height * stickerY - targetH / 2;
+            ctx.drawImage(stickerImg, px, py, targetW, targetH);
+          } else if (stickerChar) {
+            ctx.font = Math.round(canvas.width * 0.22) + 'px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(stickerChar, canvas.width * stickerX, canvas.height * stickerY);
+          }
           ctx.restore();
         }
       }
 
-      // flash cut
+      // flash cut — Ghost-/Glitch-Versatz statt schlichtem Weißblitz
       if (flashAlpha > 0) {
-        ctx.fillStyle = 'rgba(255,255,255,' + flashAlpha + ')';
+        glitchCtx.clearRect(0, 0, canvas.width, canvas.height);
+        glitchCtx.drawImage(canvas, 0, 0);
+        const offset = Math.round(flashAlpha * 16);
+        ctx.save();
+        ctx.globalCompositeOperation = 'screen';
+        ctx.globalAlpha = Math.min(0.5, flashAlpha * 0.6);
+        ctx.drawImage(glitchCanvas, -offset, 0);
+        ctx.drawImage(glitchCanvas, offset, 0);
+        ctx.restore();
+
+        ctx.fillStyle = 'rgba(255,255,255,' + (flashAlpha * 0.5) + ')';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        flashAlpha -= 0.12;
+        flashAlpha -= 0.16;
       }
 
       stageTime.textContent = elapsed.toFixed(1) + 's / ' + total.toFixed(1) + 's';
