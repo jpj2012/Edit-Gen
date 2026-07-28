@@ -474,6 +474,12 @@
       <input type="range" id="startOffset" min="0" max="0" value="0" step="1">
       <div class="range-val" id="startOffsetVal">0s</div>
     </div>
+
+    <label class="checkbox-row" id="beatSyncRow" style="margin-top:16px; opacity:0.4;">
+      <input type="checkbox" id="beatSync" disabled>
+      Cuts auf die Beats vom Song synchronisieren
+    </label>
+    <p class="desc" id="beatSyncHint" style="margin:6px 0 0;">Lade zuerst einen Track hoch. Bei aktivierter Beat-Sync wird die Länge oben ignoriert — sie ergibt sich automatisch aus den erkannten Beats.</p>
   </div>
 
   <!-- STYLE -->
@@ -545,6 +551,8 @@
   const audioNameText = document.getElementById('audioNameText');
   const startOffset = document.getElementById('startOffset');
   const startOffsetVal = document.getElementById('startOffsetVal');
+  const beatSyncCheckbox = document.getElementById('beatSync');
+  const beatSyncHint = document.getElementById('beatSyncHint');
   const customLen = document.getElementById('customLen');
   const lengthPresets = document.getElementById('lengthPresets');
   const generateBtn = document.getElementById('generateBtn');
@@ -670,8 +678,25 @@
       startOffsetVal.textContent = '0s';
     });
     updateGenerateState();
+    updateBeatSyncAvailability();
     saveAudioToDB(file);
   }
+
+  function updateBeatSyncAvailability() {
+    const hasAudio = !!audioFile;
+    beatSyncCheckbox.disabled = !hasAudio;
+    document.getElementById('beatSyncRow').style.opacity = hasAudio ? '1' : '0.4';
+    if (!hasAudio) {
+      beatSyncCheckbox.checked = false;
+      beatSyncHint.textContent = 'Lade zuerst einen Track hoch. Bei aktivierter Beat-Sync wird die Länge oben ignoriert — sie ergibt sich automatisch aus den erkannten Beats.';
+    } else if (beatSyncCheckbox.checked) {
+      beatSyncHint.textContent = 'Aktiv: Jedes Bild bleibt so viele Beats stehen (mind. 1), dass die Länge oben ungefähr getroffen wird — exakte Sekundenlänge ist dann nicht mehr garantiert.';
+    } else {
+      beatSyncHint.textContent = 'Schneidet jeden Clip auf den Beat, statt auf feste Sekunden — die Länge oben wird dabei nur noch ungefähr getroffen.';
+    }
+  }
+
+  beatSyncCheckbox.addEventListener('change', updateBeatSyncAvailability);
 
   // ---------- Track-Speicherung (IndexedDB) ----------
   // Merkt sich den zuletzt hochgeladenen Track über Seiten-Reloads und neue
@@ -735,6 +760,7 @@
     audioInput.value = '';
     clearAudioFromDB();
     updateGenerateState();
+    updateBeatSyncAvailability();
   });
 
   loadAudioFromDB().then((file) => { if (file) handleAudioFile(file); });
@@ -876,7 +902,113 @@
     }
   }
 
-  // ---------- NOISE PATTERN (grain) ----------
+  // ---------- BEAT DETECTION ----------
+  // Einfache, browserseitige Beat-Erkennung: Song offline durch einen Tiefpass
+  // (betont Kick/Bass) schicken, Energie in kleinen Zeitfenstern messen und
+  // Stellen markieren, an denen die Energie deutlich über dem lokalen
+  // Durchschnitt liegt (klassischer Ansatz für Onset-/Beat-Erkennung ohne
+  // externe Bibliothek).
+  async function detectBeats(file, offsetSec) {
+    const arrayBuffer = await file.arrayBuffer();
+    const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    let audioBuffer;
+    try {
+      audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
+    } finally {
+      decodeCtx.close();
+    }
+
+    const sampleRate = audioBuffer.sampleRate;
+    const offlineCtx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(
+      1, audioBuffer.length, sampleRate
+    );
+    const source = offlineCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    const lowpass = offlineCtx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 150; // Kick-/Bass-Bereich betonen
+    source.connect(lowpass);
+    lowpass.connect(offlineCtx.destination);
+    source.start(0);
+    const rendered = await offlineCtx.startRendering();
+    const data = rendered.getChannelData(0);
+
+    const windowSize = Math.max(1, Math.floor(sampleRate * 0.02)); // 20ms-Fenster
+    const windowCount = Math.ceil(data.length / windowSize);
+    const energies = new Float32Array(windowCount);
+    for (let w = 0; w < windowCount; w++) {
+      const start = w * windowSize;
+      const end = Math.min(start + windowSize, data.length);
+      let sum = 0;
+      for (let i = start; i < end; i++) sum += data[i] * data[i];
+      energies[w] = sum / (end - start);
+    }
+
+    const historyWindows = 50; // ca. 1s lokaler Vergleichszeitraum
+    const minGapWindows = Math.round(0.25 / 0.02); // min. 250ms zwischen zwei Beats
+    const beatWindows = [];
+    let lastBeat = -minGapWindows;
+    for (let w = 0; w < windowCount; w++) {
+      const histStart = Math.max(0, w - historyWindows);
+      let sum = 0;
+      for (let i = histStart; i < w; i++) sum += energies[i];
+      const localAvg = w > histStart ? sum / (w - histStart) : 0;
+      const threshold = localAvg * 1.4 + 0.000015;
+      if (energies[w] > threshold && (w - lastBeat) >= minGapWindows) {
+        beatWindows.push(w);
+        lastBeat = w;
+      }
+    }
+
+    const beatTimes = beatWindows.map(w => (w * windowSize) / sampleRate);
+    return beatTimes.filter(t => t >= offsetSec).map(t => t - offsetSec);
+  }
+
+  // Baut aus erkannten Beat-Zeitpunkten eine Segmentdauer pro Clip.
+  // Damit die oben gewählte Gesamtlänge zumindest annähernd getroffen wird,
+  // bleibt jedes Bild/Clip ggf. mehrere Beats stehen (z.B. 3 Beats pro Bild)
+  // statt zwingend nur einen. Kürzer als 1 Beat wird ein Clip dabei nie.
+  function beatsToSegmentDurations(beats, clipCount, targetLength) {
+    let points = beats.slice();
+    if (points.length === 0 || points[0] > 0.05) points.unshift(0);
+
+    // Durchschnittlichen Beat-Abstand schätzen (Median ist robuster gegen
+    // einzelne Ausreißer, z.B. eine kurze Pause im Song).
+    let avgGap = 0.5;
+    if (points.length >= 2) {
+      const gaps = [];
+      for (let i = 1; i < points.length; i++) gaps.push(points[i] - points[i - 1]);
+      gaps.sort((a, b) => a - b);
+      avgGap = gaps[Math.floor(gaps.length / 2)] || 0.5;
+    }
+    if (avgGap <= 0.05) avgGap = 0.5;
+
+    // Wie viele Beats müssten ein Clip stehen bleiben, damit die
+    // vorgegebene Gesamtlänge ungefähr erreicht wird? Mindestens 1 Beat.
+    const beatsInTarget = targetLength / avgGap;
+    const beatsPerClip = Math.max(1, Math.round(beatsInTarget / clipCount));
+
+    const neededBeatPoints = clipCount * beatsPerClip + 1;
+    if (points.length < neededBeatPoints) {
+      let t = points[points.length - 1];
+      while (points.length < neededBeatPoints) {
+        t += avgGap;
+        points.push(t);
+      }
+    } else if (points.length > neededBeatPoints) {
+      points = points.slice(0, neededBeatPoints);
+    }
+
+    const durations = [];
+    for (let i = 0; i < clipCount; i++) {
+      const from = points[i * beatsPerClip];
+      const to = points[(i + 1) * beatsPerClip];
+      durations.push(Math.max(0.15, to - from));
+    }
+    return durations;
+  }
+
+
 
   const noiseCanvas = document.createElement('canvas');
   noiseCanvas.width = 96; noiseCanvas.height = 96;
@@ -985,11 +1117,30 @@
     }
 
     lastStep = 'Audio-/Recorder-Setup';
-    const total = selectedLength;
-    const segDur = total / mediaItems.length;
     const flashOn = document.getElementById('flashCuts').checked;
     const zoomOn = document.getElementById('zoomPunch').checked;
     const stickersOn = document.getElementById('stickers').checked;
+    const beatSyncOn = beatSyncCheckbox.checked && !!audioFile;
+
+    let segDurations = null;
+    if (beatSyncOn) {
+      lastStep = 'Beats im Song erkennen';
+      try {
+        const offsetSec = parseInt(startOffset.value, 10) || 0;
+        const beats = await detectBeats(audioFile, offsetSec);
+        segDurations = beatsToSegmentDurations(beats, mediaItems.length, selectedLength);
+      } catch (e) {
+        segDurations = null; // Fallback: feste Länge, falls Beat-Erkennung scheitert
+      }
+      if (renderCancelled) return;
+    }
+
+    const total = segDurations ? segDurations.reduce((a, b) => a + b, 0) : selectedLength;
+    const segDur = total / mediaItems.length; // Fallback für Nicht-Beat-Sync
+    // Kumulative Grenzen für variable Segmentlängen bei Beat-Sync
+    const segBoundaries = segDurations
+      ? segDurations.reduce((acc, d) => { acc.push((acc.length ? acc[acc.length - 1] : 0) + d); return acc; }, [])
+      : null;
 
     // Audio graph — nur aufbauen, wenn wirklich eine Musikdatei gewählt wurde.
     // Ein erzwungener "stiller" Audio-Track (Variante die vorher hier stand) hat
@@ -1058,6 +1209,7 @@
     generateBtn.disabled = true;
 
     let currentSegIndex = -1;
+    let currentSegDur = segDur;
     let flashAlpha = 0;
     let nextStickerAt = -1;
     let stickerChar = '';
@@ -1072,6 +1224,7 @@
 
     function onSegmentEnter(idx) {
       pauseAllVideos();
+      currentSegDur = segDurations ? segDurations[idx] : segDur;
       const item = mediaItems[idx];
       if (item.type === 'video' && item.el) {
         item.el.currentTime = 0;
@@ -1101,7 +1254,7 @@
       let shakeX = 0, shakeY = 0;
       if (zoomOn) {
         const segElapsed = (performance.now() - segStartTime) / 1000;
-        const punchProgress = segElapsed / segDur;
+        const punchProgress = segElapsed / currentSegDur;
         zoom = 1 + Math.min(0.1, 0.1 * punchProgress);
         // Kamera-Wackeln: stärker direkt beim Cut, klingt schnell ab
         const shakeAmount = Math.max(0, 0.35 - segElapsed) * 6;
@@ -1131,7 +1284,13 @@
 
       if (elapsed >= total) { finishRender(); return; }
 
-      const segIndex = Math.min(mediaItems.length - 1, Math.floor(elapsed / segDur));
+      let segIndex;
+      if (segBoundaries) {
+        segIndex = segBoundaries.findIndex(b => elapsed < b);
+        if (segIndex === -1) segIndex = mediaItems.length - 1;
+      } else {
+        segIndex = Math.min(mediaItems.length - 1, Math.floor(elapsed / segDur));
+      }
       if (segIndex !== currentSegIndex) {
         currentSegIndex = segIndex;
         segStartTime = now;
@@ -1164,19 +1323,18 @@
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.globalAlpha = 1;
 
-      // sticker
+      // sticker — bleibt über die komplette Dauer des Bildes/Clips sichtbar
       if (stickerImg && stickerImg.naturalWidth > 0) {
         const segElapsed = (now - segStartTime) / 1000;
-        if (segElapsed < 0.45) {
-          ctx.save();
-          ctx.globalAlpha = Math.max(0, 1 - segElapsed / 0.45);
-          const targetW = canvas.width * 0.32;
-          const targetH = targetW * (stickerImg.naturalHeight / stickerImg.naturalWidth);
-          const px = canvas.width * stickerX - targetW / 2;
-          const py = canvas.height * stickerY - targetH / 2;
-          ctx.drawImage(stickerImg, px, py, targetW, targetH);
-          ctx.restore();
-        }
+        const fadeIn = 0.15;
+        ctx.save();
+        ctx.globalAlpha = Math.min(1, segElapsed / fadeIn);
+        const targetW = canvas.width * 0.32;
+        const targetH = targetW * (stickerImg.naturalHeight / stickerImg.naturalWidth);
+        const px = canvas.width * stickerX - targetW / 2;
+        const py = canvas.height * stickerY - targetH / 2;
+        ctx.drawImage(stickerImg, px, py, targetW, targetH);
+        ctx.restore();
       }
 
       // flash cut — Ghost-/Glitch-Versatz statt schlichtem Weißblitz
