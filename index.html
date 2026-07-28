@@ -965,47 +965,75 @@
   }
 
   // Baut aus erkannten Beat-Zeitpunkten eine Segmentdauer pro Clip.
-  // Damit die oben gewählte Gesamtlänge zumindest annähernd getroffen wird,
-  // bleibt jedes Bild/Clip ggf. mehrere Beats stehen (z.B. 3 Beats pro Bild)
-  // statt zwingend nur einen. Kürzer als 1 Beat wird ein Clip dabei nie.
+  // Wichtig: Die Beats-pro-Clip-Zahl wird NICHT einmal global für den ganzen
+  // Song berechnet (das passt bei Tempo-Wechseln, z.B. Half-Time/Double-Time-
+  // Stellen wie oft bei Phonk, irgendwann nicht mehr). Stattdessen wird für
+  // jedes Bild einzeln — anhand der tatsächlichen, lokalen Beat-Abstände an
+  // genau dieser Songstelle — entschieden, wie viele volle Beats es bleiben
+  // soll, um möglichst nah an die anteilige Ziellänge zu kommen. Jeder Cut
+  // landet dadurch immer auf einem echten erkannten Beat, egal ob der Song
+  // zwischendurch langsamer oder schneller wird. Minimum ist immer 1 Beat.
   function beatsToSegmentDurations(beats, clipCount, targetLength) {
     let points = beats.slice();
     if (points.length === 0 || points[0] > 0.05) points.unshift(0);
 
-    // Durchschnittlichen Beat-Abstand schätzen (Median ist robuster gegen
-    // einzelne Ausreißer, z.B. eine kurze Pause im Song).
-    let avgGap = 0.5;
+    // Nur als Rückfall gedacht, falls an einer Stelle im Song gar keine
+    // Beats mehr erkannt wurden (z.B. sehr leiser Songausklang).
+    let fallbackGap = 0.5;
     if (points.length >= 2) {
       const gaps = [];
       for (let i = 1; i < points.length; i++) gaps.push(points[i] - points[i - 1]);
       gaps.sort((a, b) => a - b);
-      avgGap = gaps[Math.floor(gaps.length / 2)] || 0.5;
+      fallbackGap = gaps[Math.floor(gaps.length / 2)] || 0.5;
     }
-    if (avgGap <= 0.05) avgGap = 0.5;
+    if (fallbackGap <= 0.05) fallbackGap = 0.5;
 
-    // Wie viele Beats müssten ein Clip stehen bleiben, damit die
-    // vorgegebene Gesamtlänge ungefähr erreicht wird? Mindestens 1 Beat.
-    const beatsInTarget = targetLength / avgGap;
-    const beatsPerClip = Math.max(1, Math.round(beatsInTarget / clipCount));
-
-    const neededBeatPoints = clipCount * beatsPerClip + 1;
-    if (points.length < neededBeatPoints) {
-      let t = points[points.length - 1];
-      while (points.length < neededBeatPoints) {
-        t += avgGap;
-        points.push(t);
+    function ensurePoint(idx) {
+      while (points.length <= idx) {
+        const lastGap = points.length >= 2
+          ? points[points.length - 1] - points[points.length - 2]
+          : fallbackGap;
+        points.push(points[points.length - 1] + (lastGap > 0.05 ? lastGap : fallbackGap));
       }
-    } else if (points.length > neededBeatPoints) {
-      points = points.slice(0, neededBeatPoints);
     }
 
+    const targetPerClip = targetLength / clipCount;
     const durations = [];
-    for (let i = 0; i < clipCount; i++) {
-      const from = points[i * beatsPerClip];
-      const to = points[(i + 1) * beatsPerClip];
-      durations.push(Math.max(0.15, to - from));
+    const cutBeatIndices = []; // beatTimes-Indizes, an denen ein neuer Clip beginnt (starkes Wackeln)
+    let cursorIdx = 0; // Index im points-Array, an dem der aktuelle Clip beginnt
+
+    for (let c = 0; c < clipCount; c++) {
+      ensurePoint(cursorIdx);
+      cutBeatIndices.push(cursorIdx);
+      const startTime = points[cursorIdx];
+
+      // Greedy, aber immer mit den echten (lokalen) Beat-Abständen: so viele
+      // volle Beats dazunehmen, bis der nächste Beat die Ziellänge für dieses
+      // Bild eher verfehlen als treffen würde. Mindestens 1 Beat.
+      let beatsUsed = 1;
+      ensurePoint(cursorIdx + beatsUsed);
+      let safety = 0;
+      while (safety++ < 2000) {
+        ensurePoint(cursorIdx + beatsUsed + 1);
+        const currentDur = points[cursorIdx + beatsUsed] - startTime;
+        const nextDur = points[cursorIdx + beatsUsed + 1] - startTime;
+        if (Math.abs(nextDur - targetPerClip) < Math.abs(currentDur - targetPerClip)) {
+          beatsUsed++;
+        } else {
+          break;
+        }
+      }
+
+      const endTime = points[cursorIdx + beatsUsed];
+      durations.push(Math.max(0.15, endTime - startTime));
+      cursorIdx += beatsUsed;
     }
-    return durations;
+
+    return {
+      durations,
+      beatTimes: points.slice(0, cursorIdx + 1),
+      cutBeatIndices
+    };
   }
 
 
@@ -1123,14 +1151,21 @@
     const beatSyncOn = beatSyncCheckbox.checked && !!audioFile;
 
     let segDurations = null;
+    let allBeatTimes = null;
+    let cutBeatIndexSet = null;
     if (beatSyncOn) {
       lastStep = 'Beats im Song erkennen';
       try {
         const offsetSec = parseInt(startOffset.value, 10) || 0;
         const beats = await detectBeats(audioFile, offsetSec);
-        segDurations = beatsToSegmentDurations(beats, mediaItems.length, selectedLength);
+        const beatResult = beatsToSegmentDurations(beats, mediaItems.length, selectedLength);
+        segDurations = beatResult.durations;
+        allBeatTimes = beatResult.beatTimes;
+        cutBeatIndexSet = new Set(beatResult.cutBeatIndices);
       } catch (e) {
         segDurations = null; // Fallback: feste Länge, falls Beat-Erkennung scheitert
+        allBeatTimes = null;
+        cutBeatIndexSet = null;
       }
       if (renderCancelled) return;
     }
@@ -1217,6 +1252,8 @@
     let stickerX = 0, stickerY = 0;
     let startTime = null;
     let stopped = false;
+    let nextBeatIdx = 0;
+    let beatPulseStartTime = -1e9; // letzter "kleiner" Wackler bei einem Zwischen-Beat
 
     function pauseAllVideos() {
       mediaItems.forEach(m => { if (m.type === 'video' && m.el) m.el.pause(); });
@@ -1257,7 +1294,13 @@
         const punchProgress = segElapsed / currentSegDur;
         zoom = 1 + Math.min(0.1, 0.1 * punchProgress);
         // Kamera-Wackeln: stärker direkt beim Cut, klingt schnell ab
-        const shakeAmount = Math.max(0, 0.35 - segElapsed) * 6;
+        const cutShake = Math.max(0, 0.35 - segElapsed) * 6;
+        // Zusätzlich ein kleineres Wackeln bei jedem Zwischen-Beat (nur Beat-Sync,
+        // nur wenn ein Bild mehrere Beats stehen bleibt — bei nur 1 Beat pro Bild
+        // ist jeder Beat ohnehin schon ein Cut und nutzt das stärkere Wackeln oben).
+        const beatElapsed = (performance.now() - beatPulseStartTime) / 1000;
+        const beatShake = Math.max(0, 0.18 - beatElapsed) * 2.2;
+        const shakeAmount = cutShake + beatShake;
         shakeX = (Math.random() - 0.5) * shakeAmount;
         shakeY = (Math.random() - 0.5) * shakeAmount;
       }
@@ -1295,6 +1338,17 @@
         currentSegIndex = segIndex;
         segStartTime = now;
         onSegmentEnter(segIndex);
+      }
+
+      // Zwischen-Beats (kein Cut): kleines Wackeln auslösen. Cuts selbst lösen
+      // ihr eigenes, stärkeres Wackeln bereits oben über onSegmentEnter aus.
+      if (allBeatTimes) {
+        while (nextBeatIdx < allBeatTimes.length && allBeatTimes[nextBeatIdx] <= elapsed) {
+          if (!cutBeatIndexSet.has(nextBeatIdx)) {
+            beatPulseStartTime = now;
+          }
+          nextBeatIdx++;
+        }
       }
 
       const item = mediaItems[segIndex];
