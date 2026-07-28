@@ -1062,6 +1062,7 @@
   let renderCancelled = false;
   let activeAudioCtx = null;
   let activeRecorder = null;
+  let activeRenderAudioEl = null; // frisches Audio-Element des aktuell laufenden Render-Vorgangs
 
   function abortRender(message) {
     renderCancelled = true;
@@ -1069,7 +1070,8 @@
     try { if (activeRecorder && activeRecorder.state !== 'inactive') activeRecorder.stop(); } catch (e) {}
     try { if (activeAudioCtx) activeAudioCtx.close(); } catch (e) {}
     try { mediaItems.forEach(m => { if (m.type === 'video' && m.el) m.el.pause(); }); } catch (e) {}
-    try { if (audioEl) audioEl.pause(); } catch (e) {}
+    try { if (activeRenderAudioEl) activeRenderAudioEl.pause(); } catch (e) {}
+    activeRenderAudioEl = null;
     stage.classList.remove('active');
     generateBtn.disabled = false;
     if (message) hintMsg.textContent = message;
@@ -1181,6 +1183,7 @@
     // Ein erzwungener "stiller" Audio-Track (Variante die vorher hier stand) hat
     // die Aufnahme ohne Musik auf manchen Geräten instabil/kaputt gemacht.
     let audioCtx = null, audioTracks = [];
+    let renderAudioEl = null;
     if (audioFile) {
       lastStep = 'AudioContext erstellen';
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1192,13 +1195,30 @@
       if (audioCtx.state === 'suspended') {
         await Promise.race([audioCtx.resume(), new Promise((r) => setTimeout(r, 3000))]);
       }
+      lastStep = 'Audio-Element vorbereiten';
+      // WICHTIG: Ein <audio>-Element darf pro Browser-Tab nur EIN EINZIGES MAL an
+      // createMediaElementSource() angehängt werden — ein zweiter Versuch mit
+      // demselben Element wirft einen Fehler bzw. liefert stillen Ton. Da das
+      // gespeicherte/wiederhergestellte Element über mehrere Render-Vorgänge
+      // hinweg bestehen bleibt, bauen wir hier bei JEDEM Render ein frisches
+      // Audio-Element direkt aus der gespeicherten Datei.
+      renderAudioEl = new Audio();
+      renderAudioEl.src = URL.createObjectURL(audioFile);
+      activeRenderAudioEl = renderAudioEl;
+      await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        renderAudioEl.addEventListener('loadedmetadata', finish, { once: true });
+        renderAudioEl.addEventListener('canplay', finish, { once: true });
+        setTimeout(finish, 4000); // Sicherheitsnetz, falls loadedmetadata mal nicht feuert
+      });
       lastStep = 'Audio-Graph aufbauen';
       const destNode = audioCtx.createMediaStreamDestination();
-      const sourceNode = audioCtx.createMediaElementSource(audioEl);
+      const sourceNode = audioCtx.createMediaElementSource(renderAudioEl);
       sourceNode.connect(destNode);
       sourceNode.connect(audioCtx.destination);
-      audioEl.currentTime = parseInt(startOffset.value, 10) || 0;
-      audioEl.loop = true;
+      renderAudioEl.currentTime = parseInt(startOffset.value, 10) || 0;
+      renderAudioEl.loop = true;
       audioTracks = destNode.stream.getAudioTracks();
     }
 
@@ -1449,6 +1469,10 @@
       resultBox.classList.add('shown');
       resultBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
       if (audioCtx) audioCtx.close();
+      if (renderAudioEl) {
+        try { URL.revokeObjectURL(renderAudioEl.src); } catch (e) {}
+      }
+      activeRenderAudioEl = null;
     }
 
     function finishRender() {
@@ -1466,7 +1490,7 @@
         if (!completed) completeWithChunks();
       }, 5000);
       pauseAllVideos();
-      if (audioEl) audioEl.pause();
+      if (renderAudioEl) renderAudioEl.pause();
     }
 
     recorder.onstop = () => {
@@ -1476,7 +1500,7 @@
     lastStep = 'Recorder starten';
     recorder.start(200);
     lastStep = 'Audio abspielen';
-    if (audioEl) { try { await audioEl.play(); } catch (e) {} }
+    if (renderAudioEl) { try { await renderAudioEl.play(); } catch (e) {} }
     lastStep = 'Rendering läuft (Frames zeichnen)';
     requestAnimationFrame(frame);
 
